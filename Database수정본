@@ -1,0 +1,272 @@
+import requests
+import pandas as pd
+import os
+import time
+from tqdm import tqdm
+import glob
+import torch
+from transformers import CLIPProcessor, CLIPModel
+from PIL import Image
+import numpy as np
+import gc
+
+# --- 설정 ---
+BASE_URL = "https://collectionapi.metmuseum.org/public/collection/v1/"
+OUTPUT_DIR = "met_artworks"
+CSV_FILE = os.path.join(OUTPUT_DIR, "processed_artworks.csv")
+
+# 폴더 생성 (데이터 수집 폴더)
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+    print(f"'{OUTPUT_DIR}' 폴더를 생성했습니다.")
+
+# --- 1. 모든 부서 ID를 가져와 작품 ID를 분할 수집 ---
+all_object_ids = set() # 중복 방지를 위해 set 사용
+
+try:
+    print("1-1. 모든 부서(Department) ID를 가져오는 중...")
+    departments_response = requests.get(f"{BASE_URL}departments")
+    departments_response.raise_for_status()
+    departments_data = departments_response.json()
+    
+    department_ids = [dept['departmentId'] for dept in departments_data['departments']]
+    print(f"총 {len(department_ids)}개의 부서를 찾았습니다.")
+
+    print("\n1-2. 부서별 작품 ID를 분할하여 수집 중...")
+    for dept_id in tqdm(department_ids, desc="부서별 ID 수집"):
+        try:
+            # 특정 부서 ID를 사용하여 작품 ID 목록 요청
+            dept_url = f"{BASE_URL}objects?departmentIds={dept_id}"
+            objects_response = requests.get(dept_url)
+            objects_response.raise_for_status()
+            objects_data = objects_response.json()
+            
+            current_ids = objects_data.get('objectIDs', [])
+            all_object_ids.update(current_ids)
+            
+            time.sleep(0.05) # API Rate Limit 회피를 위해 0.05초 대기
+            
+        except requests.exceptions.RequestException as e:
+            continue
+
+    object_ids_list = list(all_object_ids)
+    print(f"\n✅ 분할 수집을 통해 총 {len(object_ids_list)}개의 고유 작품 ID를 성공적으로 수집했습니다.")
+
+except requests.exceptions.RequestException as e:
+    print(f"초기 API 호출 중 치명적인 오류 발생: {e}")
+    object_ids_list = []
+
+# --- 2. 상세 정보 수집 및 이미지 다운로드 ---
+artworks_list = [] # 메타데이터를 저장할 리스트
+MAX_COLLECTION = 50 # 테스트를 위해 수집할 최대 작품 수 (전체를 원하면 len(object_ids_list)로 변경)
+
+print(f"\n2. 상세 정보 수집 및 이미지 다운로드 중 (최대 {MAX_COLLECTION}개)...")
+
+for object_id in tqdm(object_ids_list, desc="작품 상세 정보 처리"):
+    if len(artworks_list) >= MAX_COLLECTION:
+        break
+    try:
+        object_url = f"{BASE_URL}objects/{object_id}"
+        artwork_response = requests.get(object_url)
+        artwork_response.raise_for_status()
+        artwork_data = artwork_response.json()
+        
+        image_url = artwork_data.get('primaryImage')
+        
+        if image_url:
+            # ⭐⭐⭐ 20가지 항목으로 확장된 메타데이터 수집 ⭐⭐⭐
+            artwork_info = {
+                # 1. 기본 식별 정보
+                'objectID': artwork_data.get('objectID'),
+                'isPublicDomain': artwork_data.get('isPublicDomain'),
+                'primaryImage': artwork_data.get('primaryImage'),
+                'title': artwork_data.get('title'),
+                'objectName': artwork_data.get('objectName'),
+                
+                # 2. 작가 및 제작 정보
+                'artistDisplayName': artwork_data.get('artistDisplayName'),
+                'artistNationality': artwork_data.get('artistNationality'),
+                'artistBeginDate': artwork_data.get('artistBeginDate'),
+                'artistEndDate': artwork_data.get('artistEndDate'),
+                'objectDate': artwork_data.get('objectDate'),
+                'objectBeginDate': artwork_data.get('objectBeginDate'),
+                'objectEndDate': artwork_data.get('objectEndDate'),
+                
+                # 3. 물리적 및 분류 정보
+                'medium': artwork_data.get('medium'),
+                'dimensions': artwork_data.get('dimensions'),
+                'culture': artwork_data.get('culture'),
+                'department': artwork_data.get('department'),
+                'geographyType': artwork_data.get('geographyType'),
+                'city': artwork_data.get('city'),
+                
+                # 4. 추가 정보
+                'classification': artwork_data.get('classification'),
+                'repository': artwork_data.get('repository')
+            }
+            artworks_list.append(artwork_info)
+            
+            # 이미지 다운로드 로직 (기존 유지)
+            image_filename = os.path.join(OUTPUT_DIR, f"{object_id}.jpg")
+            if not os.path.exists(image_filename):
+                image_data = requests.get(image_url, stream=True)
+                image_data.raise_for_status()
+                with open(image_filename, 'wb') as f:
+                    for chunk in image_data.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        
+        time.sleep(0.05)
+            
+    except requests.exceptions.RequestException as e:
+        continue
+
+# --- 3. 데이터 전처리 및 CSV 저장 ---
+print("\n3. 데이터 전처리 및 CSV 파일 저장 중...")
+if artworks_list:
+    df = pd.DataFrame(artworks_list)
+    df['artistDisplayName'].fillna('Unknown', inplace=True)
+    df['objectID'] = df['objectID'].astype(int)
+    df.set_index('objectID', inplace=True)
+    
+    # PermissionError 방지를 위해 try-except로 최종 저장
+    try:
+        df.to_csv(CSV_FILE, encoding='utf-8')
+    except PermissionError:
+        print(f"\n❌ PermissionError: CSV 파일이 열려있습니다. 파일을 닫고 재시도하세요.")
+        exit() # 저장 실패 시 프로그램 종료
+
+    print(f"✅ 최종 {len(df)}개 작품의 메타데이터를 '{CSV_FILE}'에 저장했습니다.")
+    print(f"✅ 이미지 파일은 '{OUTPUT_DIR}' 폴더에 저장되었습니다.")
+else:
+    print("❌ 수집된 작품 데이터가 없습니다.")
+
+# =========================================================================
+# === 2부: 비전 임베딩 모델 적용 (수정 없이 그대로 유지) ===
+# =========================================================================
+
+import torch
+from transformers import CLIPProcessor, CLIPModel
+from PIL import Image
+import numpy as np
+import gc
+
+# --- 설정 (절대 경로 보장) ---
+BASE_PATH = os.getcwd()
+OUTPUT_DIR = os.path.join(BASE_PATH, "met_artworks")
+EMBEDDINGS_DIR = os.path.join(OUTPUT_DIR, "embeddings")
+CSV_FILE = os.path.join(OUTPUT_DIR, "processed_artworks.csv")
+
+# 폴더 생성
+if not os.path.exists(EMBEDDINGS_DIR):
+    os.makedirs(EMBEDDINGS_DIR)
+    print(f"'{EMBEDDINGS_DIR}' 폴더를 생성했습니다.")
+
+try:
+    print("\n1. CLIP 모델과 프로세서 로드 중...")
+    model_name = "openai/clip-vit-base-patch32"
+    
+    # use_fast=False 옵션 우회 적용
+    processor = CLIPProcessor.from_pretrained(model_name, use_fast=False)
+    model = CLIPModel.from_pretrained(model_name)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    print(f"  - 모델 로드 완료 ({model_name}). 사용 장치: {device}")
+    
+except Exception as e:
+    print(f"❌ 모델 로드 중 치명적인 오류 발생: {e}. 라이브러리 상태를 확인하세요.")
+    exit()
+
+try:
+    df = pd.read_csv(CSV_FILE, index_col='objectID', encoding='utf-8')
+    print(f"\n2. 메타데이터 로드 완료. 총 {len(df)}개 작품 처리 예정.")
+    
+    # CSV 로드 후 인덱스 타입을 문자열로 강제 변환 (df.loc 충돌 방지)
+    df.index = df.index.astype(str)
+    
+    # 'embedding_filepath' 컬럼이 없으면 생성
+    if 'embedding_filepath' not in df.columns:
+        df['embedding_filepath'] = ''
+        print("  - 'embedding_filepath' 컬럼이 성공적으로 생성되었습니다.")
+        
+except Exception as e:
+    print(f"❌ CSV 파일 로드 중 오류 발생: {e}. 파일 경로를 확인하세요.")
+    exit()
+
+print("\n3. 이미지 벡터 생성 및 저장 중...")
+for object_id, row in tqdm(df.iterrows(), total=len(df), desc="벡터 생성 진행률"):
+    
+    object_id_str = str(object_id) # 인덱스를 str로 사용
+    embedding_filepath = os.path.join(EMBEDDINGS_DIR, f"{object_id_str}.npy")
+
+    if os.path.exists(embedding_filepath):
+        df.loc[object_id_str, 'embedding_filepath'] = embedding_filepath
+        continue
+
+    # ⭐ 이미지 파일 존재 유연하게 확인 (glob을 사용하지 않도록 수정)
+    image_path = os.path.join(OUTPUT_DIR, f"{object_id_str}.jpg")
+    if not os.path.exists(image_path):
+        continue
+
+    try:
+        image = Image.open(image_path).convert("RGB")
+        inputs = processor(images=image, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            image_features = model.get_image_features(**inputs)
+            
+        vector = image_features.cpu().numpy().flatten()
+        np.save(embedding_filepath, vector)
+        
+        df.loc[object_id_str, 'embedding_filepath'] = embedding_filepath
+
+        # 메모리 정리
+        if df.index.get_loc(object_id_str) % 5 == 0:
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+    except Exception as e:
+        # print(f"\n❌ 심각 오류: 작품 ID {object_id_str} 처리 중 오류 발생. 원인: {e}")
+        continue
+
+# --- 4. 최종 CSV 파일 업데이트 (저장) ---
+print("\n4. 최종 메타데이터 CSV 파일 업데이트 중...")
+
+# 벡터 경로가 기록된 행만 필터링하여 최종 저장
+df['embedding_filepath'] = df['embedding_filepath'].fillna('')
+df_final = df[df['embedding_filepath'].str.len() > 0].copy()
+
+try:
+    df_final.to_csv(CSV_FILE, encoding='utf-8')
+    
+    print(f"✅ 최종 {len(df_final)}개 작품의 벡터 생성 및 CSV 업데이트 완료.")
+    print(f"이제 '{CSV_FILE}' 파일에 임베딩 벡터 파일 경로가 추가되었습니다.")
+    print("\n다음 단계인 '벡터 검색 환경 구축'으로 넘어갈 수 있습니다.")
+    
+except PermissionError:
+    print(f"\n❌ PermissionError: CSV 파일이 다른 프로그램에 열려있을 수 있습니다. 파일을 닫고 다시 시도해 주세요.")
+
+# =========================================================================
+# === 3부: 벡터 확인 (테스트용) ===
+# =========================================================================
+
+# 이미지가 있는 경우, 첫 번째 작품 ID를 예시로 사용
+if len(df_final) > 0:
+    EXAMPLE_OBJECT_ID = df_final.index[0]
+    EMBEDDINGS_DIR = os.path.join(OUTPUT_DIR, "embeddings")
+    npy_filepath = os.path.join(EMBEDDINGS_DIR, f"{EXAMPLE_OBJECT_ID}.npy")
+
+    try:
+        vector_data = np.load(npy_filepath)
+        
+        print("\n--- 벡터 파일 로드 확인 ---")
+        print(f"✅ 파일 로드 성공: {npy_filepath}")
+        print(f"   - 벡터 형태 (Shape): {vector_data.shape}")
+        print("   - 벡터 값 (상위 5개):")
+        print(vector_data[:5]) 
+
+    except FileNotFoundError:
+        print(f"❌ 오류: 벡터 파일 로드 실패. NPY 파일이 생성되지 않았습니다.")
+    except Exception as e:
+        print(f"❌ 오류: 파일 로드 중 문제가 발생했습니다: {e}")
